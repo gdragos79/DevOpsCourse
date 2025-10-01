@@ -4,7 +4,6 @@ set -Eeuo pipefail
 # --------------- Helpers ---------------
 
 yes_no() {
-  # Usage: if yes_no "Prompt?"; then ...; fi
   local prompt="${1:-Are you sure? (y/n): }"
   local reply
   read -rp "$prompt " reply || true
@@ -12,9 +11,21 @@ yes_no() {
   [[ "$reply" == "y" || "$reply" == "yes" ]]
 }
 
+ask_default() {
+  # ask_default "Prompt" "default"
+  local prompt="${1:?}"
+  local def="${2:-}"
+  local reply
+  if [[ -n "$def" ]]; then
+    read -rp "$prompt [$def]: " reply || true
+    echo "${reply:-$def}"
+  else
+    read -rp "$prompt: " reply || true
+    echo "$reply"
+  fi
+}
+
 require() {
-  # Ensure a command exists (install lightweight deps if apt name given)
-  # Usage: require curl curl
   local cmd="$1"; local pkg="${2:-}"
   if ! command -v "$cmd" >/dev/null 2>&1; then
     if [[ -n "$pkg" ]]; then
@@ -27,7 +38,6 @@ require() {
   fi
 }
 
-# Map Ubuntu to a Docker-supported codename
 docker_codename() {
   . /etc/os-release
   case "${VERSION_ID:-}" in
@@ -36,6 +46,16 @@ docker_codename() {
     20.04*) echo "focal" ;;
     *)      echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-jammy}}"
   esac
+}
+
+detect_minikube_driver() {
+  if command -v docker >/dev/null 2>&1; then
+    echo "docker"
+  elif command -v podman >/dev/null 2>&1; then
+    echo "podman"
+  else
+    echo "none"
+  fi
 }
 
 # --------------- Start ---------------
@@ -49,12 +69,9 @@ install_or_reinstall_docker() {
   require curl curl
   require gpg gnupg
 
-  # Clean up any wrong/duplicate Docker list files (e.g., debian/plucky)
-  sudo rm -f \
-    /etc/apt/sources.list.d/archive_uri-https_download_docker_com_linux_debian-*.list \
-    /etc/apt/sources.list.d/docker.list
+  sudo rm -f /etc/apt/sources.list.d/archive_uri-https_download_docker_com_linux_debian-*.list \
+             /etc/apt/sources.list.d/docker.list
 
-  # Keyring
   sudo install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
     | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -63,13 +80,10 @@ install_or_reinstall_docker() {
   DOCKER_CODENAME="$(docker_codename)"
   echo "Using Docker repo codename: ${DOCKER_CODENAME}"
 
-  # Repo
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${DOCKER_CODENAME} stable" \
     | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
 
-  # Normalize newlines
   sudo sed -i 's/\r$//' /etc/apt/sources.list.d/docker.list
-
   sudo apt-get update -y
 
   echo "Installing Docker Engine..."
@@ -85,7 +99,7 @@ echo
 if command -v docker >/dev/null 2>&1; then
   echo "Docker is already installed: $(docker --version)"
   if yes_no "Do you want to reinstall Docker? (y/n):"; then
-    install_or_reinstall_docker
+    install_or_reinstall_docker()
   else
     echo "Skipping Docker reinstall."
   fi
@@ -98,7 +112,7 @@ else
   fi
 fi
 
-# Optionally add current user to docker group to avoid sudo
+# Add current user to docker group (optional)
 if command -v docker >/dev/null 2>&1; then
   if yes_no "Add the current user to the 'docker' group so 'docker' works without sudo? (y/n):"; then
     sudo groupadd docker 2>/dev/null || true
@@ -167,5 +181,88 @@ else
   fi
 fi
 
+# ---------------- Minikube ----------------
 echo
-echo "All selected tools have been processed."
+install_or_reinstall_minikube() {
+  echo "Installing Minikube..."
+  require curl curl
+  ARCH="$(dpkg --print-architecture)"
+  case "$ARCH" in
+    amd64) MARCH=amd64 ;;
+    arm64) MARCH=arm64 ;;
+    *) echo "Unsupported architecture for Minikube: $ARCH" >&2; return 1 ;;
+  esac
+  cd /tmp
+  curl -fsSLO "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-${MARCH}"
+  sudo install -o root -g root -m 0755 "minikube-linux-${MARCH}" /usr/local/bin/minikube
+  rm -f "minikube-linux-${MARCH}"
+  echo "Minikube installed: $(minikube version)"
+}
+
+minikube_driver_setup() {
+  # Choose driver
+  local suggested; suggested="$(detect_minikube_driver)"
+  local driver; driver="$(ask_default "Choose Minikube driver (docker/podman/none)" "$suggested")"
+  case "$driver" in
+    docker|podman|none) : ;;
+    *) echo "Unknown driver '$driver'. Using '$suggested'."; driver="$suggested" ;;
+  esac
+
+  # Ask for resources
+  local def_cpus def_mem
+  # Defaults: 2 CPUs, 4g RAM (safe for most VMs), tweak if low memory
+  def_cpus="2"
+  def_mem="4096"
+
+  local cpus mem
+  cpus="$(ask_default "CPUs for minikube" "$def_cpus")"
+  mem="$(ask_default "Memory (MB) for minikube" "$def_mem")"
+
+  # Build start command
+  local cmd=(minikube start --driver="${driver}" --cpus="${cpus}" --memory="${mem}")
+  # If using podman, prefer rootless if available
+  if [[ "$driver" == "podman" ]]; then
+    cmd+=(--container-runtime=cri-o)
+  fi
+
+  echo "Starting Minikube: ${cmd[*]}"
+  "${cmd[@]}"
+
+  echo "Minikube status:"
+  minikube status || true
+
+  # Ensure kubectl context is set
+  if command -v kubectl >/dev/null 2>&1; then
+    kubectl config use-context minikube >/dev/null 2>&1 || true
+    echo "kubectl current-context: $(kubectl config current-context || echo 'unknown')"
+    echo "Try: kubectl get nodes"
+  fi
+}
+
+if command -v minikube >/dev/null 2>&1; then
+  echo "Minikube is already installed: $(minikube version)"
+  if yes_no "Do you want to reinstall Minikube? (y/n):"; then
+    install_or_reinstall_minikube
+  else
+    echo "Skipping Minikube reinstall."
+  fi
+else
+  echo "Minikube is not installed."
+  if yes_no "Do you want to install Minikube? (y/n):"; then
+    install_or_reinstall_minikube
+  else
+    echo "Skipping Minikube install."
+  fi
+fi
+
+# Offer to start a cluster now
+if command -v minikube >/dev/null 2>&1; then
+  if yes_no "Do you want to start a Minikube cluster now? (y/n):"; then
+    minikube_driver_setup
+  else
+    echo "You can start later with: minikube start --driver=$(detect_minikube_driver)"
+  fi
+fi
+
+echo
+echo "✅ All selected tools have been processed."
