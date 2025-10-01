@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# --------------- Helpers ---------------
+
+yes_no() {
+  # Usage: if yes_no "Prompt?"; then ...; fi
+  local prompt="${1:-Are you sure? (y/n): }"
+  local reply
+  read -rp "$prompt " reply || true
+  reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+  [[ "$reply" == "y" || "$reply" == "yes" ]]
+}
+
+require() {
+  # Ensure a command exists (install lightweight deps if apt name given)
+  # Usage: require curl curl
+  local cmd="$1"; local pkg="${2:-}"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    if [[ -n "$pkg" ]]; then
+      sudo apt-get update -y
+      sudo apt-get install -y "$pkg"
+    else
+      echo "Missing required command: $cmd" >&2
+      exit 1
+    fi
+  fi
+}
+
+# Map Ubuntu to a Docker-supported codename
+docker_codename() {
+  . /etc/os-release
+  case "${VERSION_ID:-}" in
+    24.04*) echo "noble" ;;
+    22.04*) echo "jammy" ;;
+    20.04*) echo "focal" ;;
+    *)      echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-jammy}}"
+  esac
+}
+
+# --------------- Start ---------------
+
+echo "Updating system package index..."
+sudo apt-get update -y
+
+# ---------------- Docker ----------------
+install_or_reinstall_docker() {
+  echo "Setting up Docker apt repository..."
+  require curl curl
+  require gpg gnupg
+
+  # Clean up any wrong/duplicate Docker list files (e.g., debian/plucky)
+  sudo rm -f \
+    /etc/apt/sources.list.d/archive_uri-https_download_docker_com_linux_debian-*.list \
+    /etc/apt/sources.list.d/docker.list
+
+  # Keyring
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+  DOCKER_CODENAME="$(docker_codename)"
+  echo "Using Docker repo codename: ${DOCKER_CODENAME}"
+
+  # Repo
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${DOCKER_CODENAME} stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+  # Normalize newlines
+  sudo sed -i 's/\r$//' /etc/apt/sources.list.d/docker.list
+
+  sudo apt-get update -y
+
+  echo "Installing Docker Engine..."
+  sudo apt-get remove -y docker docker-engine docker.io containerd runc || true
+  sudo apt-get install -y \
+    ca-certificates curl gnupg \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  echo "Docker installed: $(docker --version)"
+}
+
+echo
+if command -v docker >/dev/null 2>&1; then
+  echo "Docker is already installed: $(docker --version)"
+  if yes_no "Do you want to reinstall Docker? (y/n):"; then
+    install_or_reinstall_docker
+  else
+    echo "Skipping Docker reinstall."
+  fi
+else
+  echo "Docker is not installed."
+  if yes_no "Do you want to install Docker? (y/n):"; then
+    install_or_reinstall_docker
+  else
+    echo "Skipping Docker install."
+  fi
+fi
+
+# Optionally add current user to docker group to avoid sudo
+if command -v docker >/dev/null 2>&1; then
+  if yes_no "Add the current user to the 'docker' group so 'docker' works without sudo? (y/n):"; then
+    sudo groupadd docker 2>/dev/null || true
+    sudo usermod -aG docker "$USER"
+    echo "User '$USER' added to 'docker' group. Log out/in or run: newgrp docker"
+  fi
+fi
+
+# ---------------- Podman ----------------
+echo
+install_or_reinstall_podman() {
+  echo "Installing Podman..."
+  sudo apt-get update -y
+  sudo apt-get install -y podman
+  echo "Podman installed: $(podman --version)"
+}
+
+if command -v podman >/dev/null 2>&1; then
+  echo "Podman is already installed: $(podman --version)"
+  if yes_no "Do you want to reinstall Podman? (y/n):"; then
+    install_or_reinstall_podman
+  else
+    echo "Skipping Podman reinstall."
+  fi
+else
+  echo "Podman is not installed."
+  if yes_no "Do you want to install Podman? (y/n):"; then
+    install_or_reinstall_podman
+  else
+    echo "Skipping Podman install."
+  fi
+fi
+
+# ---------------- Kubernetes (kubectl) ----------------
+echo
+install_or_reinstall_kubectl() {
+  echo "Installing kubectl (stable)..."
+  require curl curl
+  ARCH="$(dpkg --print-architecture)"
+  case "$ARCH" in
+    amd64) KARCH=amd64 ;;
+    arm64) KARCH=arm64 ;;
+    armhf) KARCH=arm ;;
+    *) echo "Unsupported architecture for kubectl: $ARCH" >&2; return 1 ;;
+  esac
+  cd /tmp
+  curl -fsSLO "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${KARCH}/kubectl"
+  sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+  rm -f kubectl
+  echo "kubectl installed: $(kubectl version --client --short)"
+}
+
+if command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl is already installed: $(kubectl version --client --short || echo 'unknown')"
+  if yes_no "Do you want to reinstall kubectl? (y/n):"; then
+    install_or_reinstall_kubectl
+  else
+    echo "Skipping kubectl reinstall."
+  fi
+else
+  echo "kubectl is not installed."
+  if yes_no "Do you want to install kubectl? (y/n):"; then
+    install_or_reinstall_kubectl
+  else
+    echo "Skipping kubectl install."
+  fi
+fi
+
+echo
+echo "All selected tools have been processed."
