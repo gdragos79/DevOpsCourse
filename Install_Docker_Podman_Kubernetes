@@ -99,14 +99,14 @@ echo
 if command -v docker >/dev/null 2>&1; then
   echo "Docker is already installed: $(docker --version)"
   if yes_no "Do you want to reinstall Docker? (y/n):"; then
-    install_or_reinstall_docker()
+    install_or_reinstall_docker   # ← no parentheses
   else
     echo "Skipping Docker reinstall."
   fi
 else
   echo "Docker is not installed."
   if yes_no "Do you want to install Docker? (y/n):"; then
-    install_or_reinstall_docker
+    install_or_reinstall_docker   # ← no parentheses
   else
     echo "Skipping Docker install."
   fi
